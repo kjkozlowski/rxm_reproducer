@@ -1,4 +1,5 @@
 #include <cstring>
+#include <cassert>
 
 #include <iostream>
 #include <thread>
@@ -18,7 +19,10 @@ extern "C" {
 #include <rdma/fi_rma.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_errno.h>
+#include <rdma/fi_tagged.h>
+
 }
+#include <barrier>
 
 
 namespace {
@@ -34,16 +38,17 @@ namespace {
   hints->domain_attr->mr_mode =
       FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
   hints->domain_attr->name = nullptr;
-  hints->fabric_attr->prov_name = strdup("shm");
+  hints->fabric_attr->prov_name = strdup("verbs");
 
   hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
   hints->ep_attr->type = FI_EP_RDM;
-  hints->ep_attr->protocol = FI_PROTO_UNSPEC;
+  hints->ep_attr->protocol = FI_PROTO_RXM;
   hints->addr_format = FI_FORMAT_UNSPEC;
   hints->dest_addr = nullptr;
-  hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
-  hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+  hints->domain_attr->control_progress = FI_PROGRESS_AUTO;
+  hints->domain_attr->data_progress = FI_PROGRESS_AUTO;
   hints->caps = FI_MSG |  FI_RMA | FI_TAGGED | FI_SOURCE |  FI_DIRECTED_RECV;
+  hints->tx_attr->op_flags = FI_TRANSMIT_COMPLETE;
 
   return hints;
 }
@@ -100,7 +105,9 @@ void CHECK(int ret, const std::source_location location = std::source_location::
 
 int main() {
 
-static constexpr size_t bufferSize{1000};
+static constexpr size_t bufferSize{2011000};
+static constexpr uint64_t clientTag = 1;
+static constexpr uint64_t serverTag = 2;
 
 std::vector<char> serverAddr{};
 std::vector<char> clientAddr{};
@@ -112,6 +119,12 @@ std::condition_variable clientCv;
 
 bool serverDataReady = false;
 bool clientDataReady = false;
+
+std::barrier send_barrier(2);
+std::barrier recv_barrier(2);
+std::barrier wait_send_barrier(2);
+std::barrier wait_recv_barrier(2);
+std::mutex mtx;
 
 std::thread server([&]{
     fi_info *hints = makeHints();
@@ -141,11 +154,14 @@ std::thread server([&]{
     CHECK(fi_ep_bind(ep, &av->fid, 0));
     CHECK(fi_enable(ep));
 
-    auto buf = malloc(bufferSize);
-    std::size_t PP_MR_KEY = 0xC0DE;
-    fid_mr *mr = nullptr;
+    auto send_buf = malloc(bufferSize);
+    auto recv_buf = malloc(bufferSize);
+    std::size_t PP_MR_KEY = 10;
+    fid_mr *send_mr = nullptr;
+    fid_mr *recv_mr = nullptr;
     auto flags = FI_SEND | FI_RECV | FI_REMOTE_READ | FI_REMOTE_WRITE;
-    fi_mr_reg(domain, buf, bufferSize, flags, 0, PP_MR_KEY, 0, &(mr), nullptr);
+    fi_mr_reg(domain, send_buf, bufferSize, flags, 0, PP_MR_KEY, 0, &(send_mr), nullptr);
+    fi_mr_reg(domain, recv_buf, bufferSize, flags, 0, PP_MR_KEY++, 0, &(recv_mr), nullptr);
 
     const auto localAddr = getAddr(&ep->fid);
     fi_addr_t localFiAddr = 0;
@@ -168,15 +184,32 @@ std::thread server([&]{
     fi_addr_t remoteFiAddr = 0;
     CHECK(fi_av_insert(av, clientAddr.data(), 1, &remoteFiAddr, 0, nullptr) < 0);
 
+    while (fi_tsend(ep, send_buf, bufferSize, fi_mr_desc(send_mr), remoteFiAddr, serverTag, nullptr) != 0);
 
-    while (fi_recv(ep, buf, bufferSize, fi_mr_desc(mr), remoteFiAddr, nullptr) != 0);
+
+    send_barrier.arrive_and_wait();
+
+    while (fi_trecv(ep, recv_buf, bufferSize, fi_mr_desc(recv_mr), remoteFiAddr, clientTag, 0, nullptr) != 0);
+
+    recv_barrier.arrive_and_wait();
 
     fi_cq_err_entry comp{};
 
+    {
+      std::lock_guard lock {mtx};
+      while (fi_cq_readfrom(txCq, &comp, 1, &comp.src_addr) < 0);
+    }
+
+    wait_send_barrier.arrive_and_wait();
+
     while (fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr) < 0);
 
-    fi_close(&mr->fid);
-    free(buf);
+    wait_recv_barrier.arrive_and_wait();
+
+    fi_close(&send_mr->fid);
+    fi_close(&recv_mr->fid);
+    free(send_buf);
+    free(recv_buf);
     fi_close(&ep->fid);
     fi_close(&av->fid);
     fi_close(&rxCq->fid);
@@ -222,11 +255,14 @@ std::thread client([&]{
     CHECK(fi_ep_bind(ep, &av->fid, 0));
     CHECK(fi_enable(ep));
 
-    auto buf = malloc(bufferSize);
-    std::size_t PP_MR_KEY = 0xC0DE;
-    fid_mr *mr = nullptr;
+    auto send_buf = malloc(bufferSize);
+    auto recv_buf = malloc(bufferSize);
+    std::size_t PP_MR_KEY = 50;
+    fid_mr *send_mr = nullptr;
+    fid_mr *recv_mr = nullptr;
     auto flags = FI_SEND | FI_RECV;
-    CHECK(fi_mr_reg(domain, buf, bufferSize, flags, 0, PP_MR_KEY, 0, &(mr), nullptr));
+    CHECK(fi_mr_reg(domain, recv_buf, bufferSize, flags, 0, PP_MR_KEY, 0, &(recv_mr), nullptr));
+    CHECK(fi_mr_reg(domain, send_buf, bufferSize, flags, 0, PP_MR_KEY++, 0, &(send_mr), nullptr));
 
     const auto localAddr = getAddr(&ep->fid);
 
@@ -247,14 +283,31 @@ std::thread client([&]{
     fi_addr_t remoteFiAddr = 0;
     CHECK(fi_av_insert(av, hints->dest_addr, 1, &remoteFiAddr, 0, nullptr) < 0);
 
-    while (fi_send(ep, buf, bufferSize, fi_mr_desc(mr), remoteFiAddr, nullptr) != 0);
+    while (fi_tsend(ep, send_buf, bufferSize, fi_mr_desc(send_mr), remoteFiAddr, clientTag, nullptr) != 0);
+
+    send_barrier.arrive_and_wait();
+
+    while (fi_trecv(ep, recv_buf, bufferSize, fi_mr_desc(recv_mr), remoteFiAddr, serverTag, 0, nullptr) != 0);
+
+    recv_barrier.arrive_and_wait();
 
     fi_cq_err_entry comp{};
 
-    while (fi_cq_readfrom(txCq, &comp, 1, &comp.src_addr) < 0);
+    {
+      std::lock_guard lock {mtx};
+      while (fi_cq_readfrom(txCq, &comp, 1, &comp.src_addr) < 0);
+    }
 
-    fi_close(&mr->fid);
-    free(buf);
+    wait_send_barrier.arrive_and_wait();
+
+    while (fi_cq_readfrom(rxCq, &comp, 1, &comp.src_addr) < 0);
+
+    wait_recv_barrier.arrive_and_wait();
+
+    fi_close(&send_mr->fid);
+    fi_close(&recv_mr->fid);
+    free(send_buf);
+    free(recv_buf);
     fi_close(&ep->fid);
     fi_close(&av->fid);
     fi_close(&rxCq->fid);
